@@ -1,0 +1,190 @@
+---
+title: "README"
+author: "Jerry"
+date: "2024-12-17"
+output: pdf_document
+---
+
+# Project Title
+
+
+
+## Description
+
+This study investigates the relationship between carbon dioxide (CO$_2$) emissions and farmland usage across the contiguous United States from 1945 to 2012, recorded at 5-year intervals. By analyzing state-level data on CO$_2$ emissions and farmland acreage, we aim to determine whether states with a larger percentage of farmland produce lower CO$_2$ emissions per unit area.
+
+## Getting Started
+
+### Dependencies
+Library needed for data processing: 
+```{r preload, results=FALSE, message=FALSE, warning=FALSE}
+# if you do not have USAboundaries installed:
+install.packages("remotes")
+install.packages("sf")
+install.packages("lmtest")
+library(lmtest)
+library(remotes)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(dplyr)
+
+remotes::install_github("ropensci/USAboundaries")
+```
+
+
+All data can be found in (https://github.com/chenyun0607/STAT615), please make sure to download and process the following codes.
+
+
+
+### Executing program
+Below are the codes that started with cleaning&pivoting data 
+```{r clean-up, results=FALSE, message=FALSE, warning=FALSE}
+# Importing data on co2 emissions by state
+co2_emissions_state <- read_excel("carbon_emissions_by_state.xlsx", skip=4) %>%
+  head(-2) %>% filter(!(State %in% c("Alaska", "Hawaii", "District of Columbia")))
+
+# Importing data on cropland size by state + regions
+cropland_state_regions <- read_excel("cropland_by_state.xls", skip=2, na="-") %>% 
+  na.omit() %>% 
+  rename("RegionsAndStates" = "Regions and States", "2012" = "2012 5/")
+
+# Importing data on total land size by state + regions
+land_area_state_regions <- read_excel("total_land_by_state.xls", skip=2, na="-") %>% 
+  na.omit() %>% 
+  rename("RegionsAndStates" = "Regions and States")
+
+# Fixing some column types error:
+cropland_state_regions$'1945' <- as.numeric(cropland_state_regions$'1945')
+cropland_state_regions$'1969' <- as.numeric(cropland_state_regions$'1969')
+land_area_state_regions$'1969' <- as.numeric(land_area_state_regions$'1969')
+
+
+```
+
+```{r pivot, results=FALSE, message=FALSE, warning=FALSE}
+# Pivoting all imported data:
+cropland_pivoted <- cropland_state_regions %>% 
+  pivot_longer(cols = -RegionsAndStates, names_to = "Year", values_to = "Cropland_Area")
+
+land_area_pivoted <- land_area_state_regions %>% 
+  pivot_longer(cols = -RegionsAndStates, names_to = "Year", values_to = "Total_Land_Area")
+
+co2_emissions_pivoted <- co2_emissions_state %>% 
+  pivot_longer(cols = -State, names_to = "Year", values_to = "Total_Emissions")
+
+co2_emissions_pivoted <- left_join(co2_emissions_pivoted,
+                                   land_area_pivoted,
+                                   by=c("State"="RegionsAndStates","Year")) %>% 
+  mutate(percent_co2 = (Total_Emissions / Total_Land_Area) * 100) %>% 
+  drop_na()
+
+
+  
+excluded_regions <- c("Appalachian", "Corn Belt", "Delta States", 
+                      "Lake States", "Mountain", "Northeast", 
+                      "Northern Plains", "Southeast", "Southern Plains", "Pacific", "District of Columbia 2/", "48 States 1/", "Alaska 3/", "Hawaii 4/", "U.S. Total 1/")
+
+
+cropland_pivoted <- cropland_pivoted%>%filter(Year >= 1974)%>%filter(!is.na(Cropland_Area))%>% 
+  filter(!RegionsAndStates %in% excluded_regions)
+
+cropland_pivoted_sorted <- cropland_pivoted[order(cropland_pivoted$RegionsAndStates), ]
+cropland_pivoted$RegionsAndStates <- factor(cropland_pivoted$RegionsAndStates, levels = sort(unique(cropland_pivoted$RegionsAndStates)))
+
+df <- cbind(cropland_pivoted, co2_emission = co2_emissions_pivoted$Total_Emissions)
+```
+
+
+Below are codes used for analysis:
+```{r regression , results=FALSE, message=FALSE, warning=FALSE}
+
+# Ensure your data is ordered by state and year
+df <- df %>%
+  arrange(RegionsAndStates, Year)
+
+# Convert your dataset into a panel data frame
+# "RegionsAndStates" identifies the cross-sectional unit (state)
+# "Year" identifies the time dimension
+pdata <- pdata.frame(df, index = c("RegionsAndStates", "Year"))
+
+# Run a panel regression
+# Here is an example model where we try to explain Cropland_Area by co2_emission.
+
+model <- plm(co2_emission ~ Cropland_Area,
+             data = pdata,
+             model = "within",
+             effect = "twoways") # "within" = fixed effects model
+
+
+summary(model)
+
+linear_model <- lm(co2_emission ~ poly(Cropland_Area, 2),
+           data = pdata)
+
+
+
+#testing normality assumptions to see if the regular linear model is usable
+#test constant variance: no good 
+bptest(linear_model)
+#test residual normality: no good 
+shapiro.test(residuals(linear_model))
+#introduce lagged lm
+df$co2_lag <- dplyr::lag(df$co2_emission, 1)
+model_lag <- lm(co2_emission ~ poly(Cropland_Area, 2) + co2_lag, data = df)
+model_lag
+#test autocorrelation: no good 
+dwtest(model_lag)
+
+
+#so using non-parametric method: Bootstrapping
+set.seed(123)  # For reproducibility
+
+# Fit the original model
+original_model <- lm(co2_emission ~ poly(Cropland_Area, 2), data = df)
+
+# Extract the original coefficients
+original_coefs <- coef(original_model)
+
+# Set the number of bootstrap iterations
+B <- 1000  # You can increase to 2000 or more for better accuracy
+
+# Create a storage matrix for bootstrapped coefficients
+boot_coefs <- matrix(NA, nrow = B, ncol = length(original_coefs))
+
+# Perform the bootstrap
+for (b in 1:B) {
+  # Sample indices with replacement
+  boot_indices <- sample(seq_len(nrow(df)), size = nrow(df), replace = TRUE)
+  boot_sample <- df[boot_indices, ]
+  
+  # Refit the model on the bootstrap sample
+  boot_model <- lm(co2_emission ~ poly(Cropland_Area, 2), data = boot_sample)
+  
+  # Store the coefficients
+  boot_coefs[b, ] <- coef(boot_model)
+}
+
+# Compute bootstrap standard errors
+boot_se <- apply(boot_coefs, 2, sd)
+
+# Get bootstrap confidence intervals (e.g., 95%)
+alpha <- 0.05
+boot_ci <- apply(boot_coefs, 2, quantile, probs = c(alpha/2, 1 - alpha/2))
+
+# Summarize results
+results <- data.frame(
+  Estimate = original_coefs,
+  Boot_SE = boot_se,
+  CI_lower = boot_ci[1, ],
+  CI_upper = boot_ci[2, ]
+)
+
+print(results)
+```
+
+
+## Author
+Jerry, Chen-Yun, Yang
+
+
